@@ -42,15 +42,15 @@ logger = logging.getLogger(__name__)
 OPENAI_API_KEY = "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"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
-# Optimized configuration
-MAX_REQUESTS_PER_MINUTE = 300
-INITIAL_BATCH_SIZE = 25
-MAX_BATCH_SIZE = 50
-MIN_BATCH_SIZE = 10
-CONCURRENT_API_CALLS = 20
+# Optimized configuration for hybrid approach
+MAX_REQUESTS_PER_MINUTE = 250  # Conservative for hybrid approach
+INITIAL_BATCH_SIZE = 20
+MAX_BATCH_SIZE = 30
+MIN_BATCH_SIZE = 8
+CONCURRENT_API_CALLS = 15  # Reduced for hybrid approach
 CONNECTION_LIMIT = 500
-RETRY_ATTEMPTS = 3
-RETRY_DELAYS = [0.5, 1.0, 2.0]
+RETRY_ATTEMPTS = 5
+RETRY_DELAYS = [1.0, 2.0, 4.0, 8.0, 16.0]  # Exponential backoff
 CACHE_SIZE = 100000
 CACHE_TTL = 7200
 CPU_COUNT = mp.cpu_count()
@@ -58,9 +58,11 @@ CHUNK_SIZE = 5000
 WORKER_THREADS = min(32, CPU_COUNT * 4)
 PREFETCH_SIZE = 2000
 
-# Token pricing (GPT-4o-mini)
-INPUT_TOKEN_COST = 0.00015 / 1000
-OUTPUT_TOKEN_COST = 0.0006 / 1000
+# Token pricing (GPT-3.5-turbo and GPT-4o-mini)
+GPT35_INPUT_TOKEN_COST = 0.0005 / 1000
+GPT35_OUTPUT_TOKEN_COST = 0.0015 / 1000
+GPT4O_INPUT_TOKEN_COST = 0.00015 / 1000
+GPT4O_OUTPUT_TOKEN_COST = 0.0006 / 1000
 
 # Comprehensive classification schema as provided by user
 CLASSIFICATION_SCHEMA = {
@@ -269,7 +271,7 @@ class LRUCache:
 
 
 class AbstractClassifier:
-    """Advanced classifier with improved prompts and error handling"""
+    """Advanced classifier with hybrid GPT-3.5/GPT-4o-mini approach"""
     
     def __init__(self, api_key: str, rate_limiter: RateLimiter):
         self.api_key = api_key
@@ -278,8 +280,10 @@ class AbstractClassifier:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
+        self.total_input_tokens_gpt35 = 0
+        self.total_output_tokens_gpt35 = 0
+        self.total_input_tokens_gpt4o = 0
+        self.total_output_tokens_gpt4o = 0
         self.cache = LRUCache(CACHE_SIZE, CACHE_TTL)
         self.session = None
         self.connector = None
@@ -288,6 +292,17 @@ class AbstractClassifier:
         self.api_times = deque(maxlen=100)
         self.current_batch_size = INITIAL_BATCH_SIZE
         self.classification_stats = defaultdict(int)
+        
+        # Hybrid approach settings
+        self.confidence_threshold = 0.7  # Use GPT-4o-mini if confidence < 70%
+        self.gpt35_usage = 0
+        self.gpt4o_usage = 0
+        
+        # Circuit breaker for error handling
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 10
+        self.circuit_breaker_timeout = 60  # seconds
+        self.last_error_time = 0
     
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=60, connect=5, sock_read=30)
@@ -359,12 +374,23 @@ Subfield: [Specific subfield code from the list above]
 Confidence: [0-100]
 Reasoning: [Brief explanation of classification]"""
     
-    async def _make_api_call(self, prompt: str, retry_count: int = 0) -> Optional[Dict]:
-        """Make API call with retry logic"""
+    async def _make_api_call(self, prompt: str, model: str = "gpt-3.5-turbo", retry_count: int = 0) -> Optional[Dict]:
+        """Make API call with retry logic and circuit breaker"""
+        # Check circuit breaker
+        if self.consecutive_errors >= self.max_consecutive_errors:
+            time_since_last_error = time.time() - self.last_error_time
+            if time_since_last_error < self.circuit_breaker_timeout:
+                wait_time = self.circuit_breaker_timeout - time_since_last_error
+                logger.warning(f"Circuit breaker active, waiting {wait_time:.1f}s before retry")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.info("Circuit breaker timeout expired, resetting")
+                self.consecutive_errors = 0
+        
         await self.rate_limiter.acquire()
         
         payload = {
-            "model": "gpt-4o-mini",
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
             "max_tokens": 150,
@@ -386,35 +412,64 @@ Reasoning: [Brief explanation of classification]"""
                     # Track performance
                     self.api_times.append(time.time() - start_time)
                     
-                    # Update token counts
+                    # Update token counts based on model used
                     if 'usage' in data:
-                        self.total_input_tokens += data['usage'].get('prompt_tokens', 0)
-                        self.total_output_tokens += data['usage'].get('completion_tokens', 0)
+                        if model == "gpt-3.5-turbo":
+                            self.total_input_tokens_gpt35 += data['usage'].get('prompt_tokens', 0)
+                            self.total_output_tokens_gpt35 += data['usage'].get('completion_tokens', 0)
+                        else:  # gpt-4o-mini
+                            self.total_input_tokens_gpt4o += data['usage'].get('prompt_tokens', 0)
+                            self.total_output_tokens_gpt4o += data['usage'].get('completion_tokens', 0)
                     
+                    # Reset consecutive errors on success
+                    self.consecutive_errors = 0
                     return data
                     
                 elif response.status == 429 and retry_count < RETRY_ATTEMPTS:
-                    # Rate limit hit
-                    await asyncio.sleep(RETRY_DELAYS[retry_count])
-                    return await self._make_api_call(prompt, retry_count + 1)
+                    # Rate limit hit - use exponential backoff
+                    wait_time = RETRY_DELAYS[retry_count] * (2 ** retry_count)  # Exponential backoff
+                    logger.warning(f"Rate limit hit, waiting {wait_time}s before retry {retry_count + 1}")
+                    await asyncio.sleep(wait_time)
+                    return await self._make_api_call(prompt, model, retry_count + 1)
+                elif response.status >= 500 and retry_count < RETRY_ATTEMPTS:
+                    # Server error - use exponential backoff
+                    wait_time = RETRY_DELAYS[retry_count] * (2 ** retry_count)
+                    logger.warning(f"Server error {response.status}, waiting {wait_time}s before retry {retry_count + 1}")
+                    await asyncio.sleep(wait_time)
+                    return await self._make_api_call(prompt, model, retry_count + 1)
                 else:
                     error_text = await response.text()
                     logger.error(f"API error {response.status}: {error_text}")
                     if retry_count < RETRY_ATTEMPTS:
-                        await asyncio.sleep(RETRY_DELAYS[retry_count])
-                        return await self._make_api_call(prompt, retry_count + 1)
+                        wait_time = RETRY_DELAYS[retry_count] * (2 ** retry_count)
+                        await asyncio.sleep(wait_time)
+                        return await self._make_api_call(prompt, model, retry_count + 1)
+                    # Update circuit breaker
+                    self.consecutive_errors += 1
+                    self.last_error_time = time.time()
                     return None
                     
         except asyncio.TimeoutError:
             logger.error("API timeout")
             if retry_count < RETRY_ATTEMPTS:
-                return await self._make_api_call(prompt, retry_count + 1)
+                wait_time = RETRY_DELAYS[retry_count] * (2 ** retry_count)
+                logger.warning(f"Timeout, waiting {wait_time}s before retry {retry_count + 1}")
+                await asyncio.sleep(wait_time)
+                return await self._make_api_call(prompt, model, retry_count + 1)
+            # Update circuit breaker
+            self.consecutive_errors += 1
+            self.last_error_time = time.time()
             return None
         except Exception as e:
             logger.error(f"API error: {str(e)}")
             if retry_count < RETRY_ATTEMPTS:
-                await asyncio.sleep(RETRY_DELAYS[retry_count])
-                return await self._make_api_call(prompt, retry_count + 1)
+                wait_time = RETRY_DELAYS[retry_count] * (2 ** retry_count)
+                logger.warning(f"Exception, waiting {wait_time}s before retry {retry_count + 1}")
+                await asyncio.sleep(wait_time)
+                return await self._make_api_call(prompt, model, retry_count + 1)
+            # Update circuit breaker
+            self.consecutive_errors += 1
+            self.last_error_time = time.time()
             return None
     
     def _parse_classification_response(self, content: str) -> Dict:
@@ -461,7 +516,7 @@ Reasoning: [Brief explanation of classification]"""
         return result
     
     async def classify_abstract(self, paper: Dict) -> Dict:
-        """Classify a single abstract"""
+        """Classify a single abstract with hybrid GPT-3.5/GPT-4o-mini approach"""
         title = paper.get('Title', '')
         abstract = paper.get('Abstract', '')
         
@@ -487,13 +542,36 @@ Reasoning: [Brief explanation of classification]"""
             # Still try to classify - might be interdisciplinary
             logger.debug(f"Paper may not be computing-related: {title[:50]}")
         
-        # Build and send prompt
+        # Build prompt
         prompt = self._build_classification_prompt(title, abstract)
-        response = await self._make_api_call(prompt)
+        
+        # First attempt with GPT-3.5-turbo (faster, higher rate limits)
+        self.gpt35_usage += 1
+        response = await self._make_api_call(prompt, "gpt-3.5-turbo")
         
         if response and 'choices' in response and len(response['choices']) > 0:
             content = response['choices'][0]['message']['content']
             parsed = self._parse_classification_response(content)
+            
+            # Check if confidence is below threshold, discipline is UNKNOWN, or subfield is UNKNOWN
+            if (parsed['confidence'] < self.confidence_threshold or 
+                parsed['discipline'] == 'UNKNOWN' or 
+                parsed['subfield'] == 'UNKNOWN'):
+                # Retry with GPT-4o-mini for better accuracy
+                logger.info(f"Low confidence ({parsed['confidence']:.2f}) or UNKNOWN classification for paper: {title[:50]}... Retrying with GPT-4o-mini")
+                self.gpt4o_usage += 1
+                response2 = await self._make_api_call(prompt, "gpt-4o-mini")
+                
+                if response2 and 'choices' in response2 and len(response2['choices']) > 0:
+                    content2 = response2['choices'][0]['message']['content']
+                    parsed2 = self._parse_classification_response(content2)
+                    
+                    # Use the better result (higher confidence or more specific)
+                    if (parsed2['confidence'] > parsed['confidence'] or 
+                        parsed2['subfield'] != 'UNKNOWN' or 
+                        parsed2['discipline'] != 'UNKNOWN'):
+                        parsed = parsed2
+                        logger.info(f"GPT-4o-mini improved classification: {parsed['discipline']}/{parsed['subfield']} (confidence: {parsed['confidence']:.2f})")
             
             result = {
                 'Discipline': parsed['discipline'],
@@ -519,10 +597,24 @@ Reasoning: [Brief explanation of classification]"""
         return {**paper, **result}
     
     def get_total_cost(self) -> float:
-        """Calculate total cost"""
-        input_cost = self.total_input_tokens * INPUT_TOKEN_COST
-        output_cost = self.total_output_tokens * OUTPUT_TOKEN_COST
-        return input_cost + output_cost
+        """Calculate total cost for both models"""
+        gpt35_input_cost = self.total_input_tokens_gpt35 * GPT35_INPUT_TOKEN_COST
+        gpt35_output_cost = self.total_output_tokens_gpt35 * GPT35_OUTPUT_TOKEN_COST
+        gpt4o_input_cost = self.total_input_tokens_gpt4o * GPT4O_INPUT_TOKEN_COST
+        gpt4o_output_cost = self.total_output_tokens_gpt4o * GPT4O_OUTPUT_TOKEN_COST
+        
+        return gpt35_input_cost + gpt35_output_cost + gpt4o_input_cost + gpt4o_output_cost
+    
+    def get_model_usage_stats(self) -> Dict:
+        """Get usage statistics for both models"""
+        return {
+            'gpt35_calls': self.gpt35_usage,
+            'gpt4o_calls': self.gpt4o_usage,
+            'gpt35_tokens': self.total_input_tokens_gpt35 + self.total_output_tokens_gpt35,
+            'gpt4o_tokens': self.total_input_tokens_gpt4o + self.total_output_tokens_gpt4o,
+            'gpt35_cost': self.total_input_tokens_gpt35 * GPT35_INPUT_TOKEN_COST + self.total_output_tokens_gpt35 * GPT35_OUTPUT_TOKEN_COST,
+            'gpt4o_cost': self.total_input_tokens_gpt4o * GPT4O_INPUT_TOKEN_COST + self.total_output_tokens_gpt4o * GPT4O_OUTPUT_TOKEN_COST
+        }
     
     def adjust_batch_size(self):
         """Dynamically adjust batch size based on performance"""
@@ -555,22 +647,47 @@ class BatchProcessor:
     
     def save_checkpoint(self):
         """Save processing checkpoint"""
-        checkpoint_data = {
-            'processed_papers': self.processed_papers,
-            'failed_papers': self.failed_papers,
-            'review_papers': self.review_papers,
-            'cache': dict(self.classifier.cache.cache),
-            'total_input_tokens': self.classifier.total_input_tokens,
-            'total_output_tokens': self.classifier.total_output_tokens,
-            'papers_processed': self.papers_processed,
-            'classification_stats': dict(self.classifier.classification_stats)
-        }
-        
-        temp_file = f"{self.checkpoint_file}.tmp"
-        with open(temp_file, 'wb') as f:
-            pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(temp_file, self.checkpoint_file)
-        logger.info(f"Checkpoint saved: {self.papers_processed} papers processed")
+        try:
+            checkpoint_data = {
+                'processed_papers': self.processed_papers,
+                'failed_papers': self.failed_papers,
+                'review_papers': self.review_papers,
+                'cache': dict(self.classifier.cache.cache),
+                'total_input_tokens_gpt35': self.classifier.total_input_tokens_gpt35,
+                'total_output_tokens_gpt35': self.classifier.total_output_tokens_gpt35,
+                'total_input_tokens_gpt4o': self.classifier.total_input_tokens_gpt4o,
+                'total_output_tokens_gpt4o': self.classifier.total_output_tokens_gpt4o,
+                'gpt35_usage': self.classifier.gpt35_usage,
+                'gpt4o_usage': self.classifier.gpt4o_usage,
+                'papers_processed': self.papers_processed,
+                'classification_stats': dict(self.classifier.classification_stats)
+            }
+            
+            temp_file = f"{self.checkpoint_file}.tmp"
+            with open(temp_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temp_file, self.checkpoint_file)
+            logger.info(f"Checkpoint saved: {self.papers_processed} papers processed")
+            
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {str(e)}")
+            # Try to save a minimal checkpoint
+            try:
+                minimal_checkpoint = {
+                    'processed_papers': self.processed_papers,
+                    'papers_processed': self.papers_processed,
+                    'total_input_tokens_gpt35': self.classifier.total_input_tokens_gpt35,
+                    'total_output_tokens_gpt35': self.classifier.total_output_tokens_gpt35,
+                    'total_input_tokens_gpt4o': self.classifier.total_input_tokens_gpt4o,
+                    'total_output_tokens_gpt4o': self.classifier.total_output_tokens_gpt4o,
+                    'gpt35_usage': self.classifier.gpt35_usage,
+                    'gpt4o_usage': self.classifier.gpt4o_usage,
+                }
+                with open(f"{self.checkpoint_file}.backup", 'wb') as f:
+                    pickle.dump(minimal_checkpoint, f, protocol=pickle.HIGHEST_PROTOCOL)
+                logger.info(f"Minimal backup checkpoint saved: {self.papers_processed} papers processed")
+            except Exception as backup_error:
+                logger.error(f"Failed to save backup checkpoint: {str(backup_error)}")
     
     def load_checkpoint(self) -> bool:
         """Load checkpoint if exists"""
@@ -587,8 +704,12 @@ class BatchProcessor:
                 for key, value in checkpoint_data['cache'].items():
                     self.classifier.cache.set(key, value)
                 
-                self.classifier.total_input_tokens = checkpoint_data['total_input_tokens']
-                self.classifier.total_output_tokens = checkpoint_data['total_output_tokens']
+                self.classifier.total_input_tokens_gpt35 = checkpoint_data['total_input_tokens_gpt35']
+                self.classifier.total_output_tokens_gpt35 = checkpoint_data['total_output_tokens_gpt35']
+                self.classifier.total_input_tokens_gpt4o = checkpoint_data['total_input_tokens_gpt4o']
+                self.classifier.total_output_tokens_gpt4o = checkpoint_data['total_output_tokens_gpt4o']
+                self.classifier.gpt35_usage = checkpoint_data['gpt35_usage']
+                self.classifier.gpt4o_usage = checkpoint_data['gpt4o_usage']
                 self.papers_processed = checkpoint_data['papers_processed']
                 self.classifier.classification_stats = defaultdict(int, checkpoint_data.get('classification_stats', {}))
                 
@@ -717,9 +838,26 @@ class BatchProcessor:
                 # Progress update
                 self.print_progress(total_papers)
                 
-                # Save checkpoint periodically
+                # Save checkpoint periodically (every 500 papers)
                 if self.papers_processed % 500 == 0:
-                    self.save_checkpoint()
+                    logger.info(f"Triggering checkpoint save at {self.papers_processed} papers")
+                    try:
+                        self.save_checkpoint()
+                        logger.info(f"Checkpoint saved successfully at {self.papers_processed} papers")
+                    except Exception as e:
+                        logger.error(f"Failed to save checkpoint at {self.papers_processed} papers: {str(e)}")
+                    # Force flush logs to ensure checkpoint message is written
+                    for handler in logger.handlers:
+                        handler.flush()
+                
+                # Also save a backup checkpoint every 100 papers (more frequent)
+                if self.papers_processed % 100 == 0 and self.papers_processed % 500 != 0:
+                    logger.info(f"Triggering backup checkpoint save at {self.papers_processed} papers")
+                    try:
+                        self.save_checkpoint()
+                        logger.info(f"Backup checkpoint saved successfully at {self.papers_processed} papers")
+                    except Exception as e:
+                        logger.error(f"Failed to save backup checkpoint at {self.papers_processed} papers: {str(e)}")
         
         print()  # New line after progress
         logger.info(f"Processing complete: {self.papers_processed} papers processed")
@@ -777,6 +915,9 @@ class BatchProcessor:
     
     def save_statistics(self, output_file: str):
         """Save classification statistics"""
+        # Get model usage stats
+        model_stats = self.classifier.get_model_usage_stats()
+        
         stats = {
             'total_processed': len(self.processed_papers),
             'total_failed': len(self.failed_papers),
@@ -785,6 +926,7 @@ class BatchProcessor:
             'processing_time_seconds': time.time() - self.start_time,
             'average_papers_per_minute': self.papers_processed / ((time.time() - self.start_time) / 60),
             'cache_hit_rate': self.classifier.cache.get_hit_rate(),
+            'model_usage': model_stats,
             'disciplines': dict(self.classifier.classification_stats),
             'subfields': {},
             'confidence_distribution': {
@@ -828,6 +970,11 @@ class BatchProcessor:
         print(f"Processing time: {stats['processing_time_seconds']/3600:.1f} hours")
         print(f"Average rate: {stats['average_papers_per_minute']:.0f} papers/minute")
         print(f"Cache hit rate: {stats['cache_hit_rate']:.1%}")
+        
+        print(f"\nModel Usage:")
+        print(f"  GPT-3.5-turbo calls: {model_stats['gpt35_calls']} (${model_stats['gpt35_cost']:.2f})")
+        print(f"  GPT-4o-mini calls: {model_stats['gpt4o_calls']} (${model_stats['gpt4o_cost']:.2f})")
+        print(f"  Hybrid efficiency: {model_stats['gpt4o_calls']/(model_stats['gpt35_calls']+model_stats['gpt4o_calls'])*100:.1f}% papers needed GPT-4o-mini")
         
         print("\nDiscipline distribution:")
         for disc, count in sorted(stats['disciplines'].items(), key=lambda x: x[1], reverse=True):
