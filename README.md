@@ -15,21 +15,21 @@ A high-performance Python system for classifying research paper abstracts into c
 
 ## Installation
 
-1. **Clone the repository**:
+**Clone the repository**:
 
 ```bash
 git clone <repository>
 cd subfield_new
 ```
 
-2. **Install dependencies** (uses only built-in libraries):
+**Install dependencies** (uses only built-in libraries):
 
 ```bash
 # No external dependencies required - uses built-in Python libraries only
 # Requires Python 3.8+
 ```
 
-3. **Set up API key**:
+**Set up API key**:
 
 ```bash
 export OPENAI_API_KEY="sk-proj-your-api-key-here"
@@ -196,7 +196,7 @@ def is_computing_related(title: str, abstract: str) -> bool:
 
 The script provides real-time updates:
 
-```
+``` text
 Processing batch 5/183
 Progress: 500/18251 (2.7%), Rate: 285/min, ETA: 62.3min, Cost: $0.04
 ```
