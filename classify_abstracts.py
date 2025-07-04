@@ -57,6 +57,90 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Subfield acronym mapping
+SUBFIELD_ACRONYMS = {
+    # Computer Science subfields
+    "Artificial Intelligence & Machine Learning": "AI_ML",
+    "Computer Vision & Pattern Recognition": "CV_PR",
+    "Natural Language Processing": "NLP",
+    "Robotics & Automation": "ROB_AUTO",
+    "Data Science & Analytics": "DS_ANALYTICS",
+    "Database Systems & Data Management": "DB_DM",
+    "Computer Networks & Distributed Systems": "CN_DS",
+    "Cybersecurity & Information Security": "CYBER_SEC",
+    "Software Engineering & Development": "SW_ENG",
+    "Human-Computer Interaction": "HCI",
+    "Computer Graphics & Visualization": "CG_VIS",
+    "Operating Systems & Systems Programming": "OS_SP",
+    "Algorithms & Data Structures": "ALGO_DS",
+    "Computational Theory & Complexity": "CT_COMPLEX",
+    "Bioinformatics & Computational Biology": "BIOINFO",
+    "Computer Architecture & Hardware": "CA_HW",
+    "Mobile Computing & Ubiquitous Computing": "MOBILE_UBI",
+    "Cloud Computing & Virtualization": "CLOUD_VIRT",
+    "Internet of Things (IoT)": "IOT",
+    "Quantum Computing": "QUANTUM",
+    "Game Development & Interactive Media": "GAME_IM",
+    "Computer Education & Pedagogy": "CS_EDU",
+    "Digital Libraries & Information Retrieval": "DL_IR",
+    "Parallel Computing & High Performance Computing": "PARALLEL_HPC",
+    "Embedded Systems & Real-time Computing": "EMBEDDED_RT",
+    
+    # Information Systems subfields
+    "Enterprise Systems & ERP": "ES_ERP",
+    "Business Intelligence & Analytics": "BI_ANALYTICS",
+    "E-commerce & Digital Business": "ECOMM_DB",
+    "Knowledge Management": "KM",
+    "Decision Support Systems": "DSS",
+    "Information Systems Management": "ISM",
+    "Digital Transformation": "DIGITAL_TRANS",
+    "IT Governance & Strategy": "IT_GOV_STRAT",
+    "Business Process Management": "BPM",
+    "Social Media & Digital Marketing": "SM_DM",
+    "Healthcare Information Systems": "HIS",
+    "Educational Technology & E-learning": "ED_TECH_ELEARN",
+    "Supply Chain Management Systems": "SCMS",
+    "Customer Relationship Management (CRM)": "CRM",
+    "Enterprise Architecture": "EA",
+    "IT Service Management": "ITSM",
+    "Digital Innovation & Entrepreneurship": "DIGITAL_INNOV",
+    "Information Systems Security": "IS_SEC",
+    "Data Governance & Privacy": "DG_PRIVACY",
+    "Mobile Business Applications": "MBA",
+    "Social Computing & Collaboration": "SOC_COMP",
+    "IT Project Management": "IT_PM",
+    "Digital Strategy & Business Models": "DIGITAL_STRAT",
+    "Information Systems Research Methods": "IS_RM",
+    "IT Ethics & Social Responsibility": "IT_ETHICS",
+    
+    # Information Technology subfields
+    "IT Infrastructure & Operations": "IT_INFRA_OPS",
+    "Network Administration & Management": "NET_ADMIN",
+    "System Administration": "SYS_ADMIN",
+    "IT Support & Help Desk": "IT_SUPPORT",
+    "Web Development & Technologies": "WEB_DEV",
+    "Mobile App Development": "MOBILE_APP",
+    "DevOps & Continuous Integration": "DEVOPS_CI",
+    "IT Security & Risk Management": "IT_SEC_RISK",
+    "Data Center Management": "DC_MGMT",
+    "Cloud Services & Management": "CLOUD_SVC",
+    "IT Asset Management": "IT_ASSET",
+    "IT Service Delivery": "IT_SVC_DEL",
+    "Digital Forensics": "DIGITAL_FORENSICS",
+    "IT Compliance & Auditing": "IT_COMPLIANCE",
+    "Telecommunications & Networking": "TELECOM_NET",
+    "IT Training & Education": "IT_TRAINING",
+    "IT Consulting & Advisory": "IT_CONSULT",
+    "Emerging Technologies Integration": "EMERGING_TECH",
+    "IT Performance Monitoring": "IT_PERF_MON",
+    "Disaster Recovery & Business Continuity": "DR_BC",
+    "IT Procurement & Vendor Management": "IT_PROCVENDOR",
+    "Digital Workplace Solutions": "DIGITAL_WORKPLACE",
+    "IT Automation & Scripting": "IT_AUTO_SCRIPT",
+    "IT Documentation & Knowledge Management": "IT_DOC_KM",
+    "IT Standards & Best Practices": "IT_STANDARDS"
+}
+
 # Classification schema
 CLASSIFICATION_SCHEMA = {
     "Computer Science": {
@@ -176,6 +260,10 @@ def is_computing_related(title: str, abstract: str) -> bool:
     abstract_matches = sum(1 for kw in COMPUTING_KEYWORDS if kw in text)
     score = (title_matches * 3) + abstract_matches
     return score >= 5
+
+def get_subfield_acronym(subfield_name: str) -> str:
+    """Convert full subfield name to acronym"""
+    return SUBFIELD_ACRONYMS.get(subfield_name, subfield_name)
 
 
 
@@ -501,22 +589,22 @@ Respond with the EXACT subfield name from the list above."""
             for line in lines:
                 line_lower = line.lower()
                 
-                if 'primary discipline:' in line_lower:
+                if 'primary discipline:' in line_lower or 'discipline:' in line_lower:
                     disc_part = line.split(':', 1)[1].strip()
                     if disc_part in ['CS', 'IS', 'IT', 'NON_COMPUTING']:
                         result['discipline'] = disc_part
                 
                 elif 'subfield:' in line_lower:
                     subfield_part = line.split(':', 1)[1].strip()
-                    # Validate subfield exists in schema
+                    # Validate subfield exists in schema and convert to acronym
                     for disc_info in CLASSIFICATION_SCHEMA.values():
                         if subfield_part in disc_info['subfields']:
-                            result['subfield'] = subfield_part
+                            result['subfield'] = get_subfield_acronym(subfield_part)
                             break
                     if result['subfield'] == 'UNKNOWN' and subfield_part == 'NOT_APPLICABLE':
                         result['subfield'] = 'NOT_APPLICABLE'
                 
-                elif 'confidence:' in line_lower:
+                elif 'confidence:' in line_lower or 'confidence_score:' in line_lower:
                     try:
                         conf_str = line.split(':', 1)[1].strip()
                         result['confidence'] = int(conf_str.rstrip('%'))
@@ -552,9 +640,9 @@ Respond with the EXACT subfield name from the list above."""
         # Validate input
         if not title or not abstract or len(abstract.split()) < 20:
             result = {
-                'Primary Discipline': 'SKIPPED',
+                'Discipline': 'SKIPPED',
                 'Subfield': 'INSUFFICIENT_CONTENT',
-                'Confidence': 100,
+                'Confidence_Score': 100,
                 'Model Used': 'validation',
                 'Reasoning': 'Insufficient content for classification',
                 'Key Indicators': '',
@@ -571,9 +659,9 @@ Respond with the EXACT subfield name from the list above."""
             is_computing = await self._check_if_computing(title, abstract)
             if not is_computing:
                 result = {
-                    'Primary Discipline': 'NON_COMPUTING',
+                    'Discipline': 'NON_COMPUTING',
                     'Subfield': 'NOT_APPLICABLE',
-                    'Confidence': 95,
+                    'Confidence_Score': 95,
                     'Model Used': 'pre-filter',
                     'Reasoning': 'Paper is not related to computing or information technology',
                     'Key Indicators': '',
@@ -610,14 +698,14 @@ Respond with the EXACT subfield name from the list above."""
                 # Validate subfield exists in schema
                 disc_name = {'CS': 'Computer Science', 'IS': 'Information Systems', 'IT': 'Information Technology'}[discipline]
                 if subfield_content in CLASSIFICATION_SCHEMA[disc_name]['subfields']:
-                    subfield = subfield_content
+                    subfield = get_subfield_acronym(subfield_content)
                     confidence = 85
                     reasoning = f"Clear {discipline} paper with focus on {subfield}"
                 else:
                     # Try to match partial or handle variations
                     for sf in CLASSIFICATION_SCHEMA[disc_name]['subfields']:
                         if sf.lower() in subfield_content.lower() or subfield_content.lower() in sf.lower():
-                            subfield = sf
+                            subfield = get_subfield_acronym(sf)
                             confidence = 75
                             reasoning = f"Matched {discipline} paper to {subfield}"
                             break
@@ -634,7 +722,7 @@ Respond with the EXACT subfield name from the list above."""
                 
                 if parsed['discipline'] != 'UNKNOWN':
                     discipline = parsed['discipline']
-                    subfield = parsed['subfield']
+                    subfield = get_subfield_acronym(parsed['subfield'])
                     confidence = parsed['confidence']
                     reasoning = parsed['reasoning']
                     model_used = FALLBACK_MODEL
@@ -644,9 +732,9 @@ Respond with the EXACT subfield name from the list above."""
         
         # Final result
         result = {
-            'Primary Discipline': discipline,
+            'Discipline': discipline,
             'Subfield': subfield,
-            'Confidence': confidence,
+            'Confidence_Score': confidence,
             'Model Used': model_used,
             'Reasoning': reasoning,
             'Key Indicators': '',
@@ -691,9 +779,9 @@ Respond with the EXACT subfield name from the list above."""
                     logger.error(f"Classification failed: {str(res)}")
                     failed_result = {
                         **computing_papers[i],
-                        'Primary Discipline': 'ERROR',
+                        'Discipline': 'ERROR',
                         'Subfield': 'EXCEPTION',
-                        'Confidence': 0,
+                        'Confidence_Score': 0,
                         'Model Used': 'none',
                         'Reasoning': str(res),
                         'Key Indicators': '',
@@ -958,7 +1046,7 @@ Respond with the EXACT subfield name from the list above."""
         total_confidence = 0
         count = 0
         for paper in self.processed_papers:
-            conf = paper.get('Confidence', 0)
+            conf = paper.get('Confidence_Score', 0)
             if conf > 0:  # Exclude errors
                 total_confidence += conf
                 count += 1
