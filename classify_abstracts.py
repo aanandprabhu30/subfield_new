@@ -822,8 +822,8 @@ Respond with the EXACT subfield name from the list above."""
         # Final checkpoint
         self.save_checkpoint()
         
-        # Save results
-        await self.save_results_streaming(output_file)
+        # Save results (use regular save_results instead of streaming)
+        self.save_results(output_file)
         
         # Print final statistics
         self.print_statistics()
@@ -840,6 +840,8 @@ Respond with the EXACT subfield name from the list above."""
         return total_cost
     
     async def save_results_streaming(self, output_file: str):
+        """Save results without loading all into memory"""
+        # First save main results
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
             writer = None
             for paper in self.processed_papers:
@@ -848,8 +850,11 @@ Respond with the EXACT subfield name from the list above."""
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
                 writer.writerow(paper)
-                if len(self.processed_papers) > 10000:
-                    self.processed_papers.pop(0)
+        
+        logger.info(f"Results saved to {output_file}")
+        
+        # Save other files using the regular method
+        self.save_results(output_file)
     
     def save_results(self, output_file: str):
         """Save all results to CSV files"""
