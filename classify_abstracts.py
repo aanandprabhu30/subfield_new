@@ -29,10 +29,10 @@ from asyncio import Queue, Semaphore, gather, create_task
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
-# Performance settings
-MAX_CONCURRENT_CALLS = 20  # Maximum concurrent API calls (reduced from 100)
-BATCH_SIZE = 50  # Papers per batch (reduced from 100)
-MAX_REQUESTS_PER_MINUTE = 150  # Rate limit (reduced from 500)
+# --- Rate Limit and Performance Settings ---
+MAX_CONCURRENT_CALLS = 100  # Increased from 20
+BATCH_SIZE = 100  # Increased from 50
+MAX_REQUESTS_PER_MINUTE = 1500  # Increased from 150
 CONFIDENCE_THRESHOLD = 70  # Threshold for fallback to GPT-4o
 CHECKPOINT_INTERVAL = 100  # Save checkpoint every N papers
 
@@ -154,35 +154,47 @@ CLASSIFICATION_SCHEMA = {
     }
 }
 
-# Computing keywords for pre-filtering
+# --- Enhanced Computing Keywords and Pre-filter ---
 COMPUTING_KEYWORDS = {
-    # Technical terms
     'algorithm', 'software', 'system', 'data', 'network', 'database',
     'programming', 'code', 'application', 'platform', 'framework',
-    
-    # Computing fields
-    'artificial intelligence', 'machine learning', 'cybersecurity',
-    'cloud', 'mobile', 'web', 'digital', 'automation', 'computing',
-    
-    # IT/IS terms
-    'information technology', 'information system', 'enterprise',
-    'infrastructure', 'implementation', 'deployment', 'management',
-    
-    # Additional technical terms
-    'api', 'server', 'client', 'protocol', 'encryption', 'blockchain',
-    'iot', 'robotics', 'neural', 'deep learning', 'analytics', 'big data'
+    'computer', 'computing', 'computational', 'digital', 'cyber',
+    'ai', 'ml', 'artificial intelligence', 'machine learning', 'deep learning',
+    'neural', 'cloud', 'blockchain', 'iot', 'internet of things',
+    'api', 'microservice', 'container', 'kubernetes', 'devops',
+    'information system', 'information technology', 'it ', ' it ',
+    'enterprise', 'erp', 'crm', 'business intelligence', 'analytics',
+    'implementation', 'deployment', 'infrastructure', 'architecture',
+    'acm', 'ieee', 'software engineering', 'computer science',
+    'information management', 'technology adoption', 'digital transformation'
 }
 
-
 def is_computing_related(title: str, abstract: str) -> bool:
-    """Pre-filter papers to identify computing-related content"""
     text = (title + " " + abstract).lower()
-    
-    # Count keyword matches
-    matches = sum(1 for keyword in COMPUTING_KEYWORDS if keyword in text)
-    
-    # Require at least 2 keywords for better filtering
-    return matches >= 2
+    title_lower = title.lower()
+    title_matches = sum(1 for kw in COMPUTING_KEYWORDS if kw in title_lower)
+    abstract_matches = sum(1 for kw in COMPUTING_KEYWORDS if kw in text)
+    score = (title_matches * 3) + abstract_matches
+    return score >= 5
+
+# --- Quick LLM Check for Computing ---
+async def _check_if_computing(self, title: str, abstract: str) -> bool:
+    prompt = f"""Is this paper about computing, information technology, or computer science?\n\nTitle: {title}\nAbstract: {abstract[:500]}\n\nAnswer with just YES or NO."""
+    response = await self._make_api_call(prompt, PRIMARY_MODEL, max_tokens=5)
+    if response and 'choices' in response:
+        content = response['choices'][0]['message']['content'].strip().upper()
+        return 'YES' in content
+    return True
+
+# --- Two-Stage Classification Prompts ---
+def _build_discipline_prompt(self, title: str, abstract: str) -> str:
+    return f"""Classify this research paper into ONE primary discipline.\n\nTitle: {title}\nAbstract: {abstract[:1500]}\n\nDISCIPLINES:\n- CS (Computer Science): Theoretical algorithms, software development, technical research\n- IS (Information Systems): Business applications, organizational IT, enterprise systems\n- IT (Information Technology): Practical implementation, infrastructure, operations\n\nConsider the paper's PRIMARY focus. Many papers blur boundaries - choose the dominant aspect.\n\nRespond with ONLY: CS, IS, or IT"""
+
+def _build_subfield_prompt(self, discipline: str, title: str, abstract: str) -> str:
+    disc_name = {'CS': 'Computer Science', 'IS': 'Information Systems', 'IT': 'Information Technology'}[discipline]
+    subfields = CLASSIFICATION_SCHEMA[disc_name]['subfields']
+    subfield_list = '\n'.join([f"{i}. {sf}" for i, sf in enumerate(subfields, 1)])
+    return f"""This {disc_name} paper needs subfield classification.\n\nTitle: {title}\nAbstract: {abstract[:1500]}\n\nAVAILABLE SUBFIELDS:\n{subfield_list}\n\nChoose the MOST SPECIFIC subfield that best describes this paper's main contribution.\nRespond with the EXACT subfield name from the list above."""
 
 
 class RateLimiter:
@@ -293,9 +305,11 @@ class OptimizedClassificationPipeline:
         """Initialize async resources"""
         timeout = aiohttp.ClientTimeout(total=60, connect=5, sock_read=30)
         self.connector = aiohttp.TCPConnector(
-            limit=500,
-            limit_per_host=100,
-            ttl_dns_cache=300
+            limit=1000,
+            limit_per_host=500,
+            ttl_dns_cache=300,
+            keepalive_timeout=30,
+            force_close=False
         )
         self.session = aiohttp.ClientSession(
             connector=self.connector,
@@ -389,7 +403,7 @@ Key Indicators: [List 2-3 specific phrases/concepts that support this classifica
 Alternative Classification: [If applicable, note second-best choice]
 Reasoning: [2-3 sentences explaining the classification decision]"""
     
-    async def _make_api_call(self, prompt: str, model: str, retry_count: int = 0) -> Optional[Dict]:
+    async def _make_api_call(self, prompt: str, model: str, retry_count: int = 0, max_tokens: int = 200) -> Optional[Dict]:
         """Make API call with retry logic"""
         await self.rate_limiter.acquire()
         
@@ -397,7 +411,7 @@ Reasoning: [2-3 sentences explaining the classification decision]"""
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_tokens": 200,
+            "max_tokens": max_tokens,
             "presence_penalty": 0,
             "frequency_penalty": 0
         }
@@ -515,103 +529,86 @@ Reasoning: [2-3 sentences explaining the classification decision]"""
             self.cache.set(cache_key, result)
             return {**paper, **result}
         
-        # Step 1: Pre-filter
+        # Pre-filter
         if not is_computing_related(title, abstract):
-            # Still try to classify - might be interdisciplinary
-            logger.debug(f"Paper may not be computing-related: {title[:50]}")
+            is_computing = await self._check_if_computing(title, abstract)
+            if not is_computing:
+                result = {
+                    'Primary Discipline': 'NON_COMPUTING',
+                    'Subfield': 'NOT_APPLICABLE',
+                    'Confidence': 95,
+                    'Model Used': 'pre-filter',
+                    'Reasoning': 'Paper is not related to computing or information technology',
+                    'Cached': False
+                }
+                self.cache.set(cache_key, result)
+                return {**paper, **result}
         
-        # Step 2: Primary classification with GPT-4o-mini
-        prompt = self._build_primary_prompt(title, abstract)
-        response = await self._make_api_call(prompt, PRIMARY_MODEL)
+        # Stage 1: Discipline
+        disc_prompt = self._build_discipline_prompt(title, abstract)
+        disc_response = await self._make_api_call(disc_prompt, PRIMARY_MODEL, max_tokens=10)
+        discipline = 'UNKNOWN'
+        if disc_response and 'choices' in disc_response:
+            content = disc_response['choices'][0]['message']['content'].strip().upper()
+            if content in ['CS', 'IS', 'IT']:
+                discipline = content
         
-        if response and 'choices' in response and response['choices']:
-            content = response['choices'][0]['message']['content']
-            parsed = self._parse_response(content)
-            
-            # Check if fallback needed
-            if (parsed['confidence'] < CONFIDENCE_THRESHOLD or 
-                parsed['discipline'] == 'UNKNOWN' or 
-                parsed['subfield'] == 'UNKNOWN'):
-                
-                # Step 3: Fallback to GPT-4o
-                logger.info(f"Using fallback model for: {title[:50]}")
-                fallback_prompt = self._build_fallback_prompt(title, abstract)
-                fallback_response = await self._make_api_call(fallback_prompt, FALLBACK_MODEL)
-                
-                if fallback_response and 'choices' in fallback_response and fallback_response['choices']:
-                    fallback_content = fallback_response['choices'][0]['message']['content']
-                    parsed = self._parse_response(fallback_content)
-                    model_used = FALLBACK_MODEL
-                    self.model_usage[FALLBACK_MODEL] += 1
-                else:
-                    model_used = PRIMARY_MODEL + '_failed'
-            else:
-                model_used = PRIMARY_MODEL
-                self.model_usage[PRIMARY_MODEL] += 1
-            
-            result = {
-                'Primary Discipline': parsed['discipline'],
-                'Subfield': parsed['subfield'],
-                'Confidence': parsed['confidence'],
-                'Model Used': model_used,
-                'Reasoning': parsed['reasoning'],
-                'Key Indicators': ', '.join(parsed['key_indicators']),
-                'Alternative': parsed['alternative'],
-                'Cached': False
-            }
-            
-            # Track statistics
-            self.classification_stats[parsed['discipline']] += 1
-            
-            # Track low confidence
-            if parsed['confidence'] < CONFIDENCE_THRESHOLD:
-                self.low_confidence_papers.append({**paper, **result})
+        # Fallback if needed
+        if discipline == 'UNKNOWN':
+            logger.info(f"Using fallback for discipline: {title[:50]}")
+            fallback_response = await self._make_api_call(self._build_fallback_prompt(title, abstract), FALLBACK_MODEL)
+            # Parse fallback response if needed
         
-        else:
-            result = {
-                'Primary Discipline': 'ERROR',
-                'Subfield': 'API_FAILURE',
-                'Confidence': 0,
-                'Model Used': 'none',
-                'Reasoning': 'Failed to get API response',
-                'Key Indicators': '',
-                'Alternative': '',
-                'Cached': False
-            }
-            self.failed_papers.append({**paper, **result})
+        # Stage 2: Subfield
+        subfield = 'UNKNOWN'
+        if discipline in ['CS', 'IS', 'IT']:
+            subfield_prompt = self._build_subfield_prompt(discipline, title, abstract)
+            subfield_response = await self._make_api_call(subfield_prompt, PRIMARY_MODEL, max_tokens=50)
+            if subfield_response and 'choices' in subfield_response:
+                subfield_content = subfield_response['choices'][0]['message']['content'].strip()
+                subfield = subfield_content
         
-        # Cache result
+        result = {
+            'Primary Discipline': discipline,
+            'Subfield': subfield,
+            'Confidence': 80 if discipline != 'UNKNOWN' and subfield != 'UNKNOWN' else 0,
+            'Model Used': PRIMARY_MODEL,
+            'Reasoning': f"Discipline: {discipline}, Subfield: {subfield}",
+            'Cached': False
+        }
         self.cache.set(cache_key, result)
         return {**paper, **result}
     
     async def process_batch(self, papers: List[Dict]) -> List[Dict]:
         """Process a batch of papers concurrently"""
-        tasks = []
+        computing_papers = []
+        non_computing_results = []
         for paper in papers:
-            task = create_task(self.classify_paper(paper))
-            tasks.append(task)
-        
-        results = await gather(*tasks, return_exceptions=True)
-        
-        processed_results = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Classification failed: {str(result)}")
-                failed_result = {
-                    **papers[i],
-                    'Primary Discipline': 'ERROR',
-                    'Subfield': 'EXCEPTION',
-                    'Confidence': 0,
-                    'Model Used': 'none',
-                    'Reasoning': str(result),
-                    'Cached': False
-                }
-                self.failed_papers.append(failed_result)
-                processed_results.append(failed_result)
+            if is_computing_related(paper['Title'], paper['Abstract']):
+                computing_papers.append(paper)
             else:
-                processed_results.append(result)
-        
-        return processed_results
+                non_computing_results.append({
+                    **paper,
+                    'Primary Discipline': 'NON_COMPUTING',
+                    'Subfield': 'NOT_APPLICABLE',
+                    'Confidence': 95,
+                    'Model Used': 'pre-filter',
+                    'Reasoning': 'No computing keywords found',
+                    'Cached': False
+                })
+        computing_results = []
+        if computing_papers:
+            tasks = [self.classify_paper(paper) for paper in computing_papers]
+            computing_results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Flatten and handle exceptions
+            final_results = []
+            for res in computing_results:
+                if isinstance(res, Exception):
+                    final_results.append({'Primary Discipline': 'ERROR', 'Subfield': 'ERROR', 'Confidence': 0, 'Model Used': 'ERROR', 'Reasoning': str(res), 'Cached': False})
+                else:
+                    final_results.append(res)
+            computing_results = final_results
+        return non_computing_results + computing_results
     
     def save_checkpoint(self):
         """Save processing checkpoint"""
@@ -727,7 +724,7 @@ Reasoning: [2-3 sentences explaining the classification decision]"""
         self.save_checkpoint()
         
         # Save results
-        self.save_results(output_file)
+        await self.save_results_streaming(output_file)
         
         # Print final statistics
         self.print_statistics()
@@ -742,6 +739,18 @@ Reasoning: [2-3 sentences explaining the classification decision]"""
                     usage['output'] * PRICING[model]['output']
                 )
         return total_cost
+    
+    async def save_results_streaming(self, output_file: str):
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = None
+            for paper in self.processed_papers:
+                if writer is None:
+                    fieldnames = list(paper.keys())
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                writer.writerow(paper)
+                if len(self.processed_papers) > 10000:
+                    self.processed_papers.pop(0)
     
     def save_results(self, output_file: str):
         """Save all results to CSV files"""
