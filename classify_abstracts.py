@@ -177,24 +177,7 @@ def is_computing_related(title: str, abstract: str) -> bool:
     score = (title_matches * 3) + abstract_matches
     return score >= 5
 
-# --- Quick LLM Check for Computing ---
-async def _check_if_computing(self, title: str, abstract: str) -> bool:
-    prompt = f"""Is this paper about computing, information technology, or computer science?\n\nTitle: {title}\nAbstract: {abstract[:500]}\n\nAnswer with just YES or NO."""
-    response = await self._make_api_call(prompt, PRIMARY_MODEL, max_tokens=5)
-    if response and 'choices' in response:
-        content = response['choices'][0]['message']['content'].strip().upper()
-        return 'YES' in content
-    return True
 
-# --- Two-Stage Classification Prompts ---
-def _build_discipline_prompt(self, title: str, abstract: str) -> str:
-    return f"""Classify this research paper into ONE primary discipline.\n\nTitle: {title}\nAbstract: {abstract[:1500]}\n\nDISCIPLINES:\n- CS (Computer Science): Theoretical algorithms, software development, technical research\n- IS (Information Systems): Business applications, organizational IT, enterprise systems\n- IT (Information Technology): Practical implementation, infrastructure, operations\n\nConsider the paper's PRIMARY focus. Many papers blur boundaries - choose the dominant aspect.\n\nRespond with ONLY: CS, IS, or IT"""
-
-def _build_subfield_prompt(self, discipline: str, title: str, abstract: str) -> str:
-    disc_name = {'CS': 'Computer Science', 'IS': 'Information Systems', 'IT': 'Information Technology'}[discipline]
-    subfields = CLASSIFICATION_SCHEMA[disc_name]['subfields']
-    subfield_list = '\n'.join([f"{i}. {sf}" for i, sf in enumerate(subfields, 1)])
-    return f"""This {disc_name} paper needs subfield classification.\n\nTitle: {title}\nAbstract: {abstract[:1500]}\n\nAVAILABLE SUBFIELDS:\n{subfield_list}\n\nChoose the MOST SPECIFIC subfield that best describes this paper's main contribution.\nRespond with the EXACT subfield name from the list above."""
 
 
 class RateLimiter:
@@ -403,6 +386,56 @@ Key Indicators: [List 2-3 specific phrases/concepts that support this classifica
 Alternative Classification: [If applicable, note second-best choice]
 Reasoning: [2-3 sentences explaining the classification decision]"""
     
+    async def _check_if_computing(self, title: str, abstract: str) -> bool:
+        """Quick check if paper is computing-related"""
+        prompt = f"""Is this paper about computing, information technology, or computer science?
+
+Title: {title}
+Abstract: {abstract[:500]}
+
+Answer with just YES or NO."""
+        
+        response = await self._make_api_call(prompt, PRIMARY_MODEL, max_tokens=5)
+        if response and 'choices' in response:
+            content = response['choices'][0]['message']['content'].strip().upper()
+            return 'YES' in content
+        return True  # Default to attempting classification
+    
+    def _build_discipline_prompt(self, title: str, abstract: str) -> str:
+        """First stage: Classify discipline only"""
+        return f"""Classify this research paper into ONE primary discipline.
+
+Title: {title}
+Abstract: {abstract[:1500]}
+
+DISCIPLINES:
+- CS (Computer Science): Theoretical algorithms, software development, technical research
+- IS (Information Systems): Business applications, organizational IT, enterprise systems
+- IT (Information Technology): Practical implementation, infrastructure, operations
+
+Consider the paper's PRIMARY focus. Many papers blur boundaries - choose the dominant aspect.
+
+Respond with ONLY: CS, IS, or IT"""
+    
+    def _build_subfield_prompt(self, discipline: str, title: str, abstract: str) -> str:
+        """Second stage: Classify subfield within discipline"""
+        disc_name = {'CS': 'Computer Science', 'IS': 'Information Systems', 'IT': 'Information Technology'}[discipline]
+        subfields = CLASSIFICATION_SCHEMA[disc_name]['subfields']
+        
+        # Only include relevant subfields
+        subfield_list = '\n'.join([f"{i}. {sf}" for i, sf in enumerate(subfields, 1)])
+        
+        return f"""This {disc_name} paper needs subfield classification.
+
+Title: {title}
+Abstract: {abstract[:1500]}
+
+AVAILABLE SUBFIELDS:
+{subfield_list}
+
+Choose the MOST SPECIFIC subfield that best describes this paper's main contribution.
+Respond with the EXACT subfield name from the list above."""
+    
     async def _make_api_call(self, prompt: str, model: str, retry_count: int = 0, max_tokens: int = 200) -> Optional[Dict]:
         """Make API call with retry logic"""
         await self.rate_limiter.acquire()
@@ -524,13 +557,17 @@ Reasoning: [2-3 sentences explaining the classification decision]"""
                 'Confidence': 100,
                 'Model Used': 'validation',
                 'Reasoning': 'Insufficient content for classification',
+                'Key Indicators': '',
+                'Alternative': '',
                 'Cached': False
             }
             self.cache.set(cache_key, result)
+            self.classification_stats['SKIPPED'] += 1
             return {**paper, **result}
         
         # Pre-filter
         if not is_computing_related(title, abstract):
+            # Double-check with LLM
             is_computing = await self._check_if_computing(title, abstract)
             if not is_computing:
                 result = {
@@ -539,76 +576,138 @@ Reasoning: [2-3 sentences explaining the classification decision]"""
                     'Confidence': 95,
                     'Model Used': 'pre-filter',
                     'Reasoning': 'Paper is not related to computing or information technology',
+                    'Key Indicators': '',
+                    'Alternative': '',
                     'Cached': False
                 }
                 self.cache.set(cache_key, result)
+                self.classification_stats['NON_COMPUTING'] += 1
                 return {**paper, **result}
         
-        # Stage 1: Discipline
+        # Stage 1: Discipline classification
         disc_prompt = self._build_discipline_prompt(title, abstract)
         disc_response = await self._make_api_call(disc_prompt, PRIMARY_MODEL, max_tokens=10)
+        
         discipline = 'UNKNOWN'
         if disc_response and 'choices' in disc_response:
             content = disc_response['choices'][0]['message']['content'].strip().upper()
             if content in ['CS', 'IS', 'IT']:
                 discipline = content
         
-        # Fallback if needed
-        if discipline == 'UNKNOWN':
-            logger.info(f"Using fallback for discipline: {title[:50]}")
-            fallback_response = await self._make_api_call(self._build_fallback_prompt(title, abstract), FALLBACK_MODEL)
-            # Parse fallback response if needed
-        
-        # Stage 2: Subfield
+        # Stage 2: Subfield classification
         subfield = 'UNKNOWN'
-        if discipline in ['CS', 'IS', 'IT']:
+        confidence = 0
+        reasoning = ''
+        model_used = PRIMARY_MODEL
+        
+        if discipline != 'UNKNOWN':
             subfield_prompt = self._build_subfield_prompt(discipline, title, abstract)
             subfield_response = await self._make_api_call(subfield_prompt, PRIMARY_MODEL, max_tokens=50)
+            
             if subfield_response and 'choices' in subfield_response:
                 subfield_content = subfield_response['choices'][0]['message']['content'].strip()
-                subfield = subfield_content
+                
+                # Validate subfield exists in schema
+                disc_name = {'CS': 'Computer Science', 'IS': 'Information Systems', 'IT': 'Information Technology'}[discipline]
+                if subfield_content in CLASSIFICATION_SCHEMA[disc_name]['subfields']:
+                    subfield = subfield_content
+                    confidence = 85
+                    reasoning = f"Clear {discipline} paper with focus on {subfield}"
+                else:
+                    # Try to match partial or handle variations
+                    for sf in CLASSIFICATION_SCHEMA[disc_name]['subfields']:
+                        if sf.lower() in subfield_content.lower() or subfield_content.lower() in sf.lower():
+                            subfield = sf
+                            confidence = 75
+                            reasoning = f"Matched {discipline} paper to {subfield}"
+                            break
         
+        # Fallback to GPT-4o if needed
+        if discipline == 'UNKNOWN' or subfield == 'UNKNOWN' or confidence < CONFIDENCE_THRESHOLD:
+            logger.info(f"Using fallback model for: {title[:50]}")
+            fallback_prompt = self._build_fallback_prompt(title, abstract)
+            fallback_response = await self._make_api_call(fallback_prompt, FALLBACK_MODEL, max_tokens=200)
+            
+            if fallback_response and 'choices' in fallback_response:
+                fallback_content = fallback_response['choices'][0]['message']['content']
+                parsed = self._parse_response(fallback_content)
+                
+                if parsed['discipline'] != 'UNKNOWN':
+                    discipline = parsed['discipline']
+                    subfield = parsed['subfield']
+                    confidence = parsed['confidence']
+                    reasoning = parsed['reasoning']
+                    model_used = FALLBACK_MODEL
+                    self.model_usage[FALLBACK_MODEL] += 1
+        else:
+            self.model_usage[PRIMARY_MODEL] += 1
+        
+        # Final result
         result = {
             'Primary Discipline': discipline,
             'Subfield': subfield,
-            'Confidence': 80 if discipline != 'UNKNOWN' and subfield != 'UNKNOWN' else 0,
-            'Model Used': PRIMARY_MODEL,
-            'Reasoning': f"Discipline: {discipline}, Subfield: {subfield}",
+            'Confidence': confidence,
+            'Model Used': model_used,
+            'Reasoning': reasoning,
+            'Key Indicators': '',
+            'Alternative': '',
             'Cached': False
         }
+        
+        # Track statistics
+        self.classification_stats[discipline] += 1
+        
+        # Track low confidence
+        if confidence < CONFIDENCE_THRESHOLD:
+            self.low_confidence_papers.append({**paper, **result})
+        
+        # Cache result
         self.cache.set(cache_key, result)
+        
         return {**paper, **result}
     
     async def process_batch(self, papers: List[Dict]) -> List[Dict]:
-        """Process a batch of papers concurrently"""
+        """Process a batch of papers concurrently with pre-filtering"""
         computing_papers = []
         non_computing_results = []
+        
+        # Pre-filter papers
         for paper in papers:
-            if is_computing_related(paper['Title'], paper['Abstract']):
+            if is_computing_related(paper.get('Title', ''), paper.get('Abstract', '')):
                 computing_papers.append(paper)
             else:
-                non_computing_results.append({
-                    **paper,
-                    'Primary Discipline': 'NON_COMPUTING',
-                    'Subfield': 'NOT_APPLICABLE',
-                    'Confidence': 95,
-                    'Model Used': 'pre-filter',
-                    'Reasoning': 'No computing keywords found',
-                    'Cached': False
-                })
-        computing_results = []
+                # Still give them a chance with LLM check
+                computing_papers.append(paper)
+        
+        # Process all papers
         if computing_papers:
             tasks = [self.classify_paper(paper) for paper in computing_papers]
-            computing_results = await asyncio.gather(*tasks, return_exceptions=True)
-            # Flatten and handle exceptions
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Handle results and exceptions
             final_results = []
-            for res in computing_results:
+            for i, res in enumerate(results):
                 if isinstance(res, Exception):
-                    final_results.append({'Primary Discipline': 'ERROR', 'Subfield': 'ERROR', 'Confidence': 0, 'Model Used': 'ERROR', 'Reasoning': str(res), 'Cached': False})
+                    logger.error(f"Classification failed: {str(res)}")
+                    failed_result = {
+                        **computing_papers[i],
+                        'Primary Discipline': 'ERROR',
+                        'Subfield': 'EXCEPTION',
+                        'Confidence': 0,
+                        'Model Used': 'none',
+                        'Reasoning': str(res),
+                        'Key Indicators': '',
+                        'Alternative': '',
+                        'Cached': False
+                    }
+                    self.failed_papers.append(failed_result)
+                    final_results.append(failed_result)
                 else:
                     final_results.append(res)
-            computing_results = final_results
-        return non_computing_results + computing_results
+            
+            return final_results
+        
+        return non_computing_results
     
     def save_checkpoint(self):
         """Save processing checkpoint"""
