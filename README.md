@@ -16,18 +16,21 @@ A high-performance Python system for classifying research paper abstracts into c
 ## Installation
 
 1. **Clone the repository**:
+
 ```bash
 git clone <repository>
 cd subfield_new
 ```
 
 2. **Install dependencies** (uses only built-in libraries):
+
 ```bash
 # No external dependencies required - uses built-in Python libraries only
 # Requires Python 3.8+
 ```
 
 3. **Set up API key**:
+
 ```bash
 export OPENAI_API_KEY="sk-proj-your-api-key-here"
 # Or create a .env file:
@@ -37,16 +40,19 @@ echo "OPENAI_API_KEY=sk-proj-your-api-key-here" > .env
 ## Usage
 
 ### Basic Usage
+
 ```bash
 python classify_abstracts.py --input papers.csv --output results.csv
 ```
 
 ### Resume from Checkpoint
+
 ```bash
 python classify_abstracts.py --resume --input papers.csv --output results.csv
 ```
 
 ### Command-Line Options
+
 - `--input`: Input CSV file (default: Abstracts.csv)
 - `--output`: Output CSV file (default: classified_papers.csv)
 - `--resume`: Resume from checkpoint if available
@@ -55,6 +61,7 @@ python classify_abstracts.py --resume --input papers.csv --output results.csv
 ## Input Format
 
 CSV file with the following columns:
+
 ```csv
 Title,Abstract
 "Deep Learning for Computer Vision","This paper presents..."
@@ -86,12 +93,15 @@ Title,Abstract
 ## Classification Schema
 
 ### Primary Disciplines
+
 1. **Computer Science (CS)**: Theoretical algorithms, software development, technical research
 2. **Information Systems (IS)**: Business applications, organizational technology, enterprise systems
 3. **Information Technology (IT)**: Practical implementation, infrastructure, operations
 
 ### Subfields
+
 Each discipline has 25 specific subfields. Examples:
+
 - **CS**: AI & ML, Computer Vision, NLP, Robotics, Data Science, etc.
 - **IS**: Enterprise Systems, Business Intelligence, E-commerce, etc.
 - **IT**: Infrastructure, DevOps, Cloud Management, IT Security, etc.
@@ -99,6 +109,7 @@ Each discipline has 25 specific subfields. Examples:
 ## Performance
 
 ### Expected Metrics
+
 - **Classification Rate**: >90% successful
 - **UNKNOWN Rate**: <10% of computing papers
 - **Confidence Scores**: >70% average
@@ -106,6 +117,7 @@ Each discipline has 25 specific subfields. Examples:
 - **Cost**: <$0.10 for 18,251 papers
 
 ### Optimization Features
+
 - Pre-filtering reduces unnecessary API calls
 - Dynamic batch sizing adapts to API performance
 - Concurrent processing maximizes throughput
@@ -114,32 +126,41 @@ Each discipline has 25 specific subfields. Examples:
 ## Cost Estimation
 
 Based on GPT-4o-mini pricing:
+
 - Input: $0.00015 per 1K tokens
 - Output: $0.0006 per 1K tokens
 
 For 18,251 papers:
+
 - Estimated tokens: ~7M input, 1.5M output
 - Estimated cost: ~$0.08-0.10 total
 
 ## Troubleshooting
 
 ### Issue: Processing shows 0 papers
+
 **Solution**: Check if papers are already in checkpoint cache. Delete `checkpoint.pkl` to reprocess.
 
 ### Issue: High UNKNOWN rate
-**Solution**: 
+
+**Solution**:
+
 - Review computing keywords in pre-filter
 - Check if abstracts contain technical terms
 - Consider adjusting confidence threshold
 
 ### Issue: API rate limits
-**Solution**: 
+
+**Solution**:
+
 - Reduce `MAX_CONCURRENT_CALLS` in script
 - Adjust `MAX_REQUESTS_PER_MINUTE`
 - Script automatically handles rate limits with backoff
 
 ### Issue: Low confidence scores
+
 **Solution**:
+
 - Papers may be interdisciplinary
 - Review `output_review.csv` for patterns
 - Consider manual classification for edge cases
@@ -147,6 +168,7 @@ For 18,251 papers:
 ## Architecture
 
 ### Pre-filtering Function
+
 ```python
 def is_computing_related(title: str, abstract: str) -> bool:
     """Identifies computing-related papers using keyword matching"""
@@ -154,6 +176,7 @@ def is_computing_related(title: str, abstract: str) -> bool:
 ```
 
 ### Two-Stage Classification
+
 1. **Primary Classification** (GPT-4o-mini):
    - Fast, cost-effective classification
    - Handles majority of papers
@@ -164,6 +187,7 @@ def is_computing_related(title: str, abstract: str) -> bool:
    - Higher accuracy for difficult cases
 
 ### Parallel Processing
+
 - Async/await for concurrent API calls
 - Semaphore limits to 100 concurrent requests
 - Rate limiter prevents API throttling
@@ -171,6 +195,7 @@ def is_computing_related(title: str, abstract: str) -> bool:
 ## Monitoring Progress
 
 The script provides real-time updates:
+
 ```
 Processing batch 5/183
 Progress: 500/18251 (2.7%), Rate: 285/min, ETA: 62.3min, Cost: $0.04
@@ -189,6 +214,7 @@ Log file (`classification.log`) contains detailed information for debugging.
 ## Support
 
 For issues:
+
 1. Check the log file for detailed errors
 2. Ensure API key has sufficient credits
 3. Verify CSV format matches expected structure
